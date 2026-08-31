@@ -13,6 +13,7 @@ import {
 import type { McpCliOptions } from "./parse-args.js";
 
 const require = createRequire(fileURLToPath(import.meta.url));
+const MAX_HTTP_BODY_BYTES = 1_048_576;
 
 function readPackageVersion(): string {
 	try {
@@ -81,8 +82,22 @@ export async function startMcpStdioServer(
 
 async function readHttpBody(req: IncomingMessage): Promise<unknown> {
 	const chunks: Buffer[] = [];
-	for await (const chunk of req) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+	let size = 0;
+	let tooLarge = false;
+	for await (const chunk of req) {
+		const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+		size += buffer.length;
+		if (size <= MAX_HTTP_BODY_BYTES) chunks.push(buffer);
+		else tooLarge = true;
+	}
+	if (tooLarge) throw new HttpRequestError(413, "Request body exceeds the 1 MiB limit");
 	return chunks.length ? JSON.parse(Buffer.concat(chunks).toString("utf8")) : undefined;
+}
+
+class HttpRequestError extends Error {
+	constructor(readonly status: number, message: string) {
+		super(message);
+	}
 }
 
 function writeHttpError(res: ServerResponse, status: number, message: string): void {
@@ -106,6 +121,7 @@ export async function startMcpStreamableHttpServer(
 			const sessionId = typeof req.headers["mcp-session-id"] === "string" ? req.headers["mcp-session-id"] : undefined;
 			let entry = sessionId ? sessions.get(sessionId) : undefined;
 			const body = req.method === "POST" ? await readHttpBody(req) : undefined;
+			if (sessionId && !entry) return writeHttpError(res, 404, "Invalid MCP session");
 			if (!entry) {
 				if (req.method !== "POST" || typeof body !== "object" || body === null || !("method" in body) || body.method !== "initialize") {
 					return writeHttpError(res, 400, "Missing or invalid MCP session");
@@ -116,6 +132,7 @@ export async function startMcpStreamableHttpServer(
 				const toolkit = registerMcpBrowserTools(server, provider, {
 					allowedDomains: options.allowedDomains.length ? options.allowedDomains : undefined,
 					blockedDomains: options.blockedDomains.length ? options.blockedDomains : undefined,
+					defaultAuthProfile: false,
 				});
 				const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: randomUUID });
 				transport.onclose = () => {
@@ -128,6 +145,12 @@ export async function startMcpStreamableHttpServer(
 			await entry.transport.handleRequest(req, res, body);
 			if (entry.transport.sessionId) sessions.set(entry.transport.sessionId, entry);
 		} catch (error) {
+			if (error instanceof SyntaxError) {
+				return writeHttpError(res, 400, "Malformed JSON request body");
+			}
+			if (error instanceof HttpRequestError) {
+				return writeHttpError(res, error.status, error.message);
+			}
 			console.error("MCP HTTP request failed:", error);
 			if (!res.headersSent) writeHttpError(res, 500, "MCP request failed");
 			else res.end();
