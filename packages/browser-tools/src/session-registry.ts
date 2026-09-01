@@ -126,11 +126,18 @@ export class SessionRegistry {
 		DomainPolicyRestricted
 	>();
 	private beforeExitHookInstalled = false;
+	private readonly domainPolicy: DomainPolicyOptions;
+	private readonly defaultAuthProfile: string | false | undefined;
 
 	constructor(
 		public readonly provider: BrowserProvider | undefined,
-		private readonly domainPolicy: DomainPolicyOptions = {},
-	) {}
+		private readonly options: DomainPolicyOptions & {
+			defaultAuthProfile?: string | false;
+		} = {},
+	) {
+		this.domainPolicy = options;
+		this.defaultAuthProfile = options.defaultAuthProfile;
+	}
 
 	async openSession(
 		options: SessionOpenOptions = {},
@@ -145,21 +152,22 @@ export class SessionRegistry {
 		// (Kernel, Libretto Cloud) never contact a disallowed domain.
 		const startUrl = options.startUrl?.trim() || undefined;
 		const hasDomainPolicy =
-			this.domainPolicy.allowedDomains !== undefined ||
-			Boolean(this.domainPolicy.blockedDomains?.length);
+			this.options.allowedDomains !== undefined ||
+			Boolean(this.options.blockedDomains?.length);
 		if (
 			startUrl !== undefined &&
 			hasDomainPolicy &&
 			URL.canParse(startUrl) &&
-			!isUrlAllowed(startUrl, this.domainPolicy)
+			!isUrlAllowed(startUrl, this.options)
 		) {
-			throw new DomainPolicyRestricted(this.domainPolicy, startUrl);
+			throw new DomainPolicyRestricted(this.options, startUrl);
 		}
 		const authProfile =
-			options.authProfile === false
+			options.authProfile === false || this.defaultAuthProfile === false
 				? undefined
 				: (options.authProfile ??
-					(provider.supportsAuthProfiles ? "default" : undefined));
+					(this.defaultAuthProfile ??
+					(provider.supportsAuthProfiles ? "default" : undefined)));
 		const authProfileError = validateAuthProfile(provider, authProfile);
 		if (authProfileError) return authProfileError;
 		const providerSession = await provider.createSession({
