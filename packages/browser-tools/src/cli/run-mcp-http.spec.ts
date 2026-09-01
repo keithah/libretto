@@ -1,6 +1,7 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { CallToolResultSchema } from "@modelcontextprotocol/sdk/types.js";
+import { request as httpRequest, type IncomingMessage } from "node:http";
 import { expect, test as base } from "vitest";
 import type { McpCliOptions } from "./parse-args.js";
 import { startMcpHttpServer, type McpHttpServerHandle } from "./run-mcp.js";
@@ -316,4 +317,152 @@ test("a port already in use returns an error the CLI can print", async ({
 		throw new Error("expected a busy port to return an Error");
 	}
 	expect(second.message).toContain("--port");
+});
+
+test("an explicit authProfile overrides the HTTP default", async ({
+	connect,
+}) => {
+	const client = await connect();
+
+	// The HTTP server defaults to a throwaway profile, but a caller that names a
+	// profile must still get the persistent one.
+	const opened = textPayload(
+		CallToolResultSchema.parse(
+			await client.callTool({
+				name: "browser_open",
+				arguments: {
+					url: "data:text/html,<title>named profile</title>",
+					authProfile: "http-test-profile",
+				},
+			}),
+		),
+	);
+	expect(opened).toMatchObject({ ok: true });
+
+	const status = textPayload(
+		CallToolResultSchema.parse(
+			await client.callTool({ name: "browser_status", arguments: {} }),
+		),
+	) as unknown as { sessions: { authProfile?: string }[] };
+	expect(status.sessions[0]?.authProfile).toBe("http-test-profile");
+});
+
+test("requests with an unexpected Host header are refused", async ({
+	server,
+}) => {
+	// fetch() will not send a forged Host header, so use the raw client.
+	const status = await new Promise<number>((resolve, reject) => {
+		const request = httpRequest(
+			{
+				host: "127.0.0.1",
+				port: server.port,
+				path: "/mcp",
+				method: "POST",
+				headers: {
+					"content-type": "application/json",
+					accept: MCP_ACCEPT,
+					Host: "attacker.example",
+				},
+			},
+			(response: IncomingMessage) => {
+				response.resume();
+				response.on("end", () => resolve(response.statusCode ?? 0));
+			},
+		);
+		request.on("error", reject);
+		request.end(
+			JSON.stringify({
+				jsonrpc: "2.0",
+				id: 1,
+				method: "initialize",
+				params: {
+					protocolVersion: "2025-03-26",
+					capabilities: {},
+					clientInfo: { name: "rebind", version: "1.0.0" },
+				},
+			}),
+		);
+	});
+
+	expect(status).toBe(403);
+});
+
+test("an IPv6 bind address produces a usable URL", async () => {
+	const started = await startMcpHttpServer({ ...httpOptions, host: "::1" });
+	if (started instanceof Error) throw started;
+
+	try {
+		expect(started.url).toContain("[::1]");
+		const response = await fetch(started.url, {
+			method: "POST",
+			headers: { "content-type": "application/json", accept: MCP_ACCEPT },
+			body: JSON.stringify({
+				jsonrpc: "2.0",
+				id: 1,
+				method: "initialize",
+				params: {
+					protocolVersion: "2025-03-26",
+					capabilities: {},
+					clientInfo: { name: "ipv6", version: "1.0.0" },
+				},
+			}),
+		});
+		expect(response.status).toBe(200);
+		await response.body?.cancel();
+	} finally {
+		await started.close();
+	}
+});
+
+test("an unusable bind address explains how to fix --host", async () => {
+	const started = await startMcpHttpServer({
+		...httpOptions,
+		host: "203.0.113.1",
+	});
+
+	expect(started).toBeInstanceOf(Error);
+	if (!(started instanceof Error)) {
+		await started.close();
+		throw new Error("expected an unassigned address to return an Error");
+	}
+	expect(started.message).toContain("--host");
+});
+
+test("an abandoned session is closed after it goes idle", async () => {
+	// A client that crashes never sends DELETE, and the transport keeps the
+	// session alive across connection loss, so the server must expire it.
+	const started = await startMcpHttpServer(httpOptions, {
+		idleMs: 50,
+		sweepMs: 10,
+	});
+	if (started instanceof Error) throw started;
+
+	try {
+		const sessionId = await initializeSession(started.url);
+
+		await expect
+			.poll(
+				async () => {
+					const response = await fetch(started.url, {
+						method: "POST",
+						headers: {
+							"content-type": "application/json",
+							accept: MCP_ACCEPT,
+							"mcp-session-id": sessionId,
+						},
+						body: JSON.stringify({
+							jsonrpc: "2.0",
+							id: 2,
+							method: "tools/list",
+						}),
+					});
+					await response.body?.cancel();
+					return response.status;
+				},
+				{ timeout: 5_000 },
+			)
+			.toBe(404);
+	} finally {
+		await started.close();
+	}
 });

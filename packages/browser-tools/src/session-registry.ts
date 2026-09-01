@@ -162,12 +162,17 @@ export class SessionRegistry {
 		) {
 			throw new DomainPolicyRestricted(this.options, startUrl);
 		}
-		const authProfile =
-			options.authProfile === false || this.defaultAuthProfile === false
-				? undefined
-				: (options.authProfile ??
-					(this.defaultAuthProfile ??
-					(provider.supportsAuthProfiles ? "default" : undefined)));
+		// An explicit authProfile always wins. The default only applies when the
+		// caller omits it, so an HTTP client can still ask for a named profile.
+		const requested = options.authProfile ?? this.defaultAuthProfile;
+		let authProfile: string | undefined;
+		if (typeof requested === "string") {
+			authProfile = requested;
+		} else if (requested === false) {
+			authProfile = undefined;
+		} else {
+			authProfile = provider.supportsAuthProfiles ? "default" : undefined;
+		}
 		const authProfileError = validateAuthProfile(provider, authProfile);
 		if (authProfileError) return authProfileError;
 		const providerSession = await provider.createSession({

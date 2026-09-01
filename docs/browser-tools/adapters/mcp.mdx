@@ -62,9 +62,9 @@ npx -y libretto-browser-tools mcp --transport streamable-http --port 40103
 }
 ```
 
-Each MCP session gets its own provider and browser sessions, so clients never share browser state. Because several clients can connect at once, `browser_open` uses a throwaway profile unless you pass an explicit `authProfile`.
+Each MCP session gets its own provider and browser sessions, so clients never share browser state. Because several clients can connect at once, `browser_open` uses a throwaway profile unless you pass an explicit `authProfile`. A session that stops sending requests is closed after ten minutes, so a client that exits without `DELETE` does not leave a browser running.
 
-The server binds to `127.0.0.1` and has no authentication. Put it behind a proxy that handles auth before you bind a wider `--host`.
+The server checks the `Host` header and rejects values other than the address it binds, which stops a hostile page from rebinding its own name to the listener. It binds to `127.0.0.1` and has no authentication. Put it behind a proxy that handles auth before you bind a wider `--host`.
 
 Host-specific setup:
 

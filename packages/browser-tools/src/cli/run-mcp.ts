@@ -11,6 +11,7 @@ import {
 import { randomUUID } from "node:crypto";
 import { registerMcpBrowserTools } from "../adapters/mcp/index.js";
 import { errorMessage } from "../errors.js";
+import { browserCleanupErrorMessage } from "../session-registry.js";
 import {
 	createCliBrowserProvider,
 	providerSupportsHeadless,
@@ -21,6 +22,27 @@ const require = createRequire(fileURLToPath(import.meta.url));
 
 /** Largest MCP request body the HTTP transport accepts. */
 const MAX_HTTP_BODY_BYTES = 1_048_576;
+
+/** How long an HTTP MCP session may sit idle before the server closes it. */
+const HTTP_SESSION_IDLE_MS = 10 * 60 * 1000;
+
+/** How often the server looks for idle HTTP MCP sessions. */
+const HTTP_SESSION_SWEEP_MS = 60 * 1000;
+
+/** Timings the tests override to exercise idle-session cleanup quickly. */
+export type McpHttpServerTimings = {
+	idleMs?: number;
+	sweepMs?: number;
+};
+
+/**
+ * Wrap a bind address for use in a URL. IPv6 literals need brackets, while
+ * `listen` wants the raw address.
+ */
+function urlHost(host: string): string {
+	if (!host.includes(":") || host.startsWith("[")) return host;
+	return `[${host}]`;
+}
 
 function readPackageVersion(): string {
 	try {
@@ -155,6 +177,8 @@ type McpHttpSession = {
 	transport: StreamableHTTPServerTransport;
 	server: McpServer;
 	toolkit: ReturnType<typeof registerMcpBrowserTools>;
+	/** When this session last handled a request, used to expire idle clients. */
+	lastActiveAt: number;
 };
 
 /** A running Streamable HTTP server the caller owns and must close. */
@@ -175,13 +199,29 @@ export type McpHttpServerHandle = {
  */
 export async function startMcpHttpServer(
 	options: McpCliOptions,
+	timings: McpHttpServerTimings = {},
 ): Promise<Error | McpHttpServerHandle> {
+	const idleMs = timings.idleMs ?? HTTP_SESSION_IDLE_MS;
+	const sweepMs = timings.sweepMs ?? HTTP_SESSION_SWEEP_MS;
 	const sessions = new Map<string, McpHttpSession>();
+	const requestHost = urlHost(options.host);
+	// The bound port is only known after listen resolves, and `--port 0` picks
+	// one at random, so the allowed Host values are filled in below.
+	let allowedHostValues: string[] = [];
 
 	async function closeSession(session: McpHttpSession): Promise<void> {
 		await session.transport.close().catch(() => undefined);
 		await session.server.close().catch(() => undefined);
-		await session.toolkit.dispose().catch(() => undefined);
+		// dispose resolves cleanup failures as a value instead of rejecting, so
+		// report it rather than claiming the browser closed cleanly.
+		const disposed = await session.toolkit
+			.dispose()
+			.catch((cause: unknown) => new Error(errorMessage(cause)));
+		if (disposed instanceof Error) {
+			process.stderr.write(
+				`Failed to close a browser session: ${browserCleanupErrorMessage(disposed)}\n`,
+			);
+		}
 	}
 
 	const httpServer = createHttpServer((req, res) => {
@@ -192,7 +232,7 @@ export async function startMcpHttpServer(
 		req: IncomingMessage,
 		res: ServerResponse,
 	): Promise<void> {
-		const pathname = new URL(req.url ?? "/", `http://${options.host}`).pathname;
+		const pathname = new URL(req.url ?? "/", `http://${requestHost}`).pathname;
 		if (pathname !== options.path) {
 			return writeHttpError(
 				res,
@@ -254,13 +294,19 @@ export async function startMcpHttpServer(
 				});
 				const transport = new StreamableHTTPServerTransport({
 					sessionIdGenerator: randomUUID,
+					// The server has no authentication, so refuse requests whose Host
+					// header does not match the bind address. Without this a hostile
+					// page can rebind its own name to the listener and drive the
+					// browser tools.
+					enableDnsRebindingProtection: true,
+					allowedHosts: allowedHostValues,
 				});
 				transport.onclose = () => {
 					if (transport.sessionId) sessions.delete(transport.sessionId);
 					void toolkit.dispose();
 				};
 				await server.connect(transport);
-				session = { transport, server, toolkit };
+				session = { transport, server, toolkit, lastActiveAt: Date.now() };
 
 				await transport.handleRequest(req, res, body);
 				// The transport assigns the ID while handling initialize.
@@ -268,7 +314,9 @@ export async function startMcpHttpServer(
 				return;
 			}
 
+			session.lastActiveAt = Date.now();
 			await session.transport.handleRequest(req, res, body);
+			session.lastActiveAt = Date.now();
 		} catch (error) {
 			if (error instanceof HttpRequestError) {
 				return writeHttpError(res, error.status, error.message);
@@ -287,23 +335,51 @@ export async function startMcpHttpServer(
 		httpServer.listen(options.port, options.host, () => resolve(null));
 	});
 	if (listening) {
+		const cause = listening as NodeJS.ErrnoException;
+		const recovery =
+			cause.code === "EADDRNOTAVAIL" || cause.code === "ENOTFOUND"
+				? "Pass a --host address assigned to this machine, for example 127.0.0.1."
+				: "Pass a free --port, or stop the process already using it.";
 		return new Error(
-			`Could not listen on ${options.host}:${options.port} (${errorMessage(listening)}). Pass a free --port, or stop the process already using it.`,
+			`Could not listen on ${requestHost}:${options.port} (${errorMessage(listening)}). ${recovery}`,
 		);
 	}
 
 	const address = httpServer.address();
 	const port =
 		typeof address === "object" && address !== null ? address.port : options.port;
+	allowedHostValues = (
+		options.host === "127.0.0.1" || options.host === "::1"
+			? [requestHost, "localhost"]
+			: [requestHost]
+	).flatMap((name) => [name, `${name}:${port}`]);
+
+	// A client can crash without sending DELETE, and the transport keeps the
+	// session alive across connection loss, so close sessions that go quiet.
+	const sweep = setInterval(() => {
+		const deadline = Date.now() - idleMs;
+		for (const [id, session] of [...sessions]) {
+			if (session.lastActiveAt > deadline) continue;
+			sessions.delete(id);
+			void closeSession(session);
+		}
+	}, sweepMs);
+	sweep.unref();
 
 	let closed: Promise<void> | undefined;
 	return {
-		url: `http://${options.host}:${port}${options.path}`,
+		url: `http://${requestHost}:${port}${options.path}`,
 		port,
 		close: () => {
 			closed ??= (async () => {
+				clearInterval(sweep);
+				// Stop accepting first, otherwise a socket can arrive between the
+				// force-close and close and hold the server open.
+				const stopped = new Promise<void>((resolve) =>
+					httpServer.close(() => resolve()),
+				);
 				httpServer.closeAllConnections();
-				await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+				await stopped;
 				const open = [...sessions.values()];
 				sessions.clear();
 				await Promise.all(open.map(closeSession));
