@@ -37,7 +37,7 @@ permissions:
 
 jobs:
   benchmark:
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2
     timeout-minutes: 180
     env:
       ANTHROPIC_API_KEY: ${{ secrets.LIBRETTO_BENCHMARKS_ANTHROPIC_API_KEY }}

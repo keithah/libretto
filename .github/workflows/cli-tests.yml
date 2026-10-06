@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   changes:
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2
     outputs:
       tests: ${{ steps.filter.outputs.tests }}
     steps:
@@ -52,7 +52,7 @@ jobs:
           echo "tests=$tests" >> "$GITHUB_OUTPUT"
 
   checks:
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -79,7 +79,7 @@ jobs:
         run: pnpm lint
 
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2
     needs: changes
     if: needs.changes.outputs.tests == 'true'
     steps:
