@@ -10,7 +10,7 @@ on:
 
 jobs:
   review:
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2
     timeout-minutes: 20
     # Run if:
     #   - pull_request from the same repo (not a fork), OR
